@@ -1,0 +1,21 @@
+{
+    "vendor_name": "cpb",
+    "identifier_area": {
+        "x": 1440,
+        "y": 108,
+        "width": 892,
+        "height": 519
+    },
+    "identifier_hash": "bb33b173c0ccc549",
+    "fields": [
+        {
+            "field_name": "invoice_number",
+            "coordinates": {
+                "x": 381,
+                "y": 1432,
+                "width": 274,
+                "height": 52
+            }
+        }
+    ]
+}

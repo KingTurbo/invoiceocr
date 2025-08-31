@@ -1,0 +1,21 @@
+{
+    "vendor_name": "uline",
+    "identifier_area": {
+        "x": 16,
+        "y": 10,
+        "width": 443,
+        "height": 104
+    },
+    "identifier_hash": "9de4c0c2e33d641f",
+    "fields": [
+        {
+            "field_name": "invoice_number",
+            "coordinates": {
+                "x": 602,
+                "y": 103,
+                "width": 85,
+                "height": 28
+            }
+        }
+    ]
+}
