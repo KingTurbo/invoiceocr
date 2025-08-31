@@ -1,37 +1,36 @@
 import logging
 import tkinter as tk
-from tkinter import ttk, simpledialog
+from tkinter import ttk, simpledialog, messagebox
 from PIL import Image, ImageTk
-import imagehash # <-- NEW: Import the hashing library
+import imagehash
 
 logger = logging.getLogger(__name__)
 
 class LearningInterface:
-    def __init__(self, root, image_path, suggested_vendor_name, fields_config):
+    def __init__(self, root, image_path, suggested_vendor_name, fields_config, image_obj):
         self.root = root
         self.image_path = image_path
         self.vendor_name = suggested_vendor_name
+        self.fields_config = fields_config
+        self.pil_image = image_obj # Use the in-memory object
         
         self.defined_areas = {}
         self.mandatory_fields = {f['name'] for f in fields_config if f.get('mandatory') is True}
         self.all_fields = [f['name'] for f in fields_config]
 
-        # --- MODIFIED: We now store the hash, not the text ---
         self.identifier_hash = None
+        self.final_template = None
 
         self.start_x = None
         self.start_y = None
         self.selection_rect = None
 
         self.zoom_level = 1.0
-        self.pil_image = Image.open(self.image_path)
         self.tk_image = None
-        self.final_template = None
 
         self.setup_ui()
         self._on_listbox_select(None)
-        
-        # ... (bindings are the same) ...
+
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -39,7 +38,6 @@ class LearningInterface:
         self.canvas.bind("<Button-4>", self._on_zoom)
         self.canvas.bind("<Button-5>", self._on_zoom)
 
-    # ... (setup_ui, _update_image_on_canvas, _on_zoom, _on_listbox_select are the same) ...
     def setup_ui(self):
         self.root.title(f"Template Creation for: {self.vendor_name}")
         self.root.geometry("1400x900")
@@ -59,7 +57,7 @@ class LearningInterface:
         self.fields_listbox.bind('<<ListboxSelect>>', self._on_listbox_select)
         button_frame = ttk.Frame(control_panel)
         button_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
-        self.save_button = ttk.Button(button_frame, text="Save Template", command=self._on_save, state=tk.DISABLED)
+        self.save_button = ttk.Button(button_frame, text="Test and Save Template", command=self._on_save_press, state=tk.DISABLED)
         self.save_button.pack(fill=tk.X, pady=2)
         self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self._on_cancel)
         self.cancel_button.pack(fill=tk.X, pady=2)
@@ -141,19 +139,13 @@ class LearningInterface:
         if w > 0 and h > 0:
             final_coords = {"x": x, "y": y, "width": w, "height": h}
             
-            # --- MODIFIED: This is the core change to use hashing ---
             if selected_field == "**VENDOR IDENTIFIER**":
-                # Crop the original image to the selected area
                 box = (x, y, x + w, y + h)
                 identifier_image_crop = self.pil_image.crop(box)
-                
-                # Calculate the perceptual hash
                 self.identifier_hash = str(imagehash.phash(identifier_image_crop))
                 self.defined_areas[selected_field] = final_coords
                 self.fields_listbox.itemconfig(selection_indices[0], {'fg': 'white', 'bg': 'dark green'})
                 logger.info(f"Captured '{selected_field}' with hash '{self.identifier_hash}' at {final_coords}")
-
-                # Prompt for name *after* successful hash
                 new_name = simpledialog.askstring("Vendor Name", "Please enter a name for this vendor:", initialvalue=self.vendor_name, parent=self.root)
                 if new_name and new_name.strip():
                     self.vendor_name = new_name.strip()
@@ -170,61 +162,59 @@ class LearningInterface:
             
         self.start_x = None
 
-    def _on_save(self):
-        identifier_coords = self.defined_areas.pop("**VENDOR IDENTIFIER**")
-        # --- MODIFIED: Save the hash, not the text ---
-        self.final_template = {
+    def _on_save_press(self):
+        from src.ocr import engine
+
+        logger.info("--- Test Phase Initiated ---")
+        
+        # Build the proposed template in memory
+        identifier_coords = self.defined_areas["**VENDOR IDENTIFIER**"]
+        proposed_template = {
             "vendor_name": self.vendor_name,
             "identifier_area": identifier_coords,
             "identifier_hash": self.identifier_hash,
             "fields": []
         }
-        for name, coords in self.defined_areas.items():
-            self.final_template["fields"].append({"field_name": name, "coordinates": coords})
+        data_fields = {k: v for k, v in self.defined_areas.items() if k != "**VENDOR IDENTIFIER**"}
+        for name, coords in data_fields.items():
+            proposed_template["fields"].append({"field_name": name, "coordinates": coords})
 
-        logger.info(f"Final template data captured: {self.final_template}")
-        self.root.destroy()
+        # Perform targeted OCR to test the template
+        extracted_results = {}
+        for field in proposed_template["fields"]:
+            field_name = field["field_name"]
+            coords = tuple(field["coordinates"].values())
+            extracted_text = engine.extract_text_from_area(self.pil_image, coords)
+            extracted_results[field_name] = extracted_text.strip()
+        
+        # Format the results for the confirmation dialog
+        confirmation_message = "The system extracted the following data:\n\n"
+        for name, text in extracted_results.items():
+            confirmation_message += f"- {name}:  {text}\n"
+        confirmation_message += "\nIs this data correct?"
 
-    # ... (_on_cancel and start_learning_gui are the same) ...
+        # --- Confirm Phase ---
+        is_correct = messagebox.askyesno(
+            "Confirm Extracted Data",
+            confirmation_message,
+            parent=self.root
+        )
+
+        if is_correct:
+            logger.info("User confirmed extracted data is correct. Saving template.")
+            self.final_template = proposed_template
+            self.root.destroy()
+        else:
+            logger.warning("User rejected the extracted data. Returning to edit.")
+            self.instruction_label.config(text="Validation failed. Please correct your selections and try again.")
+
     def _on_cancel(self):
         logger.warning("Template creation cancelled by user.")
         self.final_template = None
         self.root.destroy()
 
-
-def start_learning_gui(image_path: str, suggested_vendor_name: str, fields_config: list) -> dict | None:
-    logger.info(f"Starting GUI for vendor '{suggested_vendor_name}' with image: {image_path}")
+def start_learning_gui(image_path: str, suggested_vendor_name: str, fields_config: list, image_obj: Image.Image) -> dict | None:
     root = tk.Tk()
-    app = LearningInterface(root, image_path, suggested_vendor_name, fields_config)
+    app = LearningInterface(root, image_path, suggested_vendor_name, fields_config, image_obj)
     root.mainloop()
     return app.final_template
-
-#### for direct testing run this script
-
-if __name__ == '__main__':
-    import sys
-    from pathlib import Path
-    
-    project_root = Path(__file__).resolve().parent.parent.parent
-    sys.path.insert(0, str(project_root))
-    
-    from src.ocr import engine
-    from src.config import FIELDS_CONFIG 
-    
-    test_image_path = project_root / "tests" / "test_invoice.png"
-
-    print("Running GUI in standalone test mode...")
-    
-    if not test_image_path.exists():
-        print(f"CRITICAL: Test image not found at expected location: {test_image_path}")
-    else:
-        logging.basicConfig(level=logging.INFO)
-        engine.initialize_reader()
-        created_template = start_learning_gui(str(test_image_path), "Test Vendor Inc.", FIELDS_CONFIG)
-        if created_template:
-            print("\n--- GUI Returned Template Data ---")
-            import json
-            print(json.dumps(created_template, indent=2))
-            print("---------------------------------")
-        else:
-            print("\nGUI was cancelled. No template data returned.")
