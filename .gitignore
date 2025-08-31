@@ -1,1 +1,8 @@
 .venv
+input
+output
+archive
+temp_processed_images
+excel_output_file
+config/templates
+config/vendors.json
