@@ -1,8 +1,14 @@
+
 import logging
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
 from PIL import Image, ImageTk
-import imagehash
+# --- DEPRECATED ---
+# import imagehash
+# --- NEW IMPORTS ---
+import cv2
+import numpy as np
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +24,11 @@ class LearningInterface:
         self.mandatory_fields = {f['name'] for f in fields_config if f.get('mandatory') is True}
         self.all_fields = [f['name'] for f in fields_config]
 
-        self.identifier_hash = None
+        # --- RE-ARCHITECTED ANCHOR DATA ---
+        # self.identifier_hash = None # This is now deprecated and removed.
+        self.anchor_descriptors_b64 = None
+        self.anchor_source_shape = None
+        # --- END RE-ARCHITECTURE ---
         self.final_template = None
 
         self.start_x = None
@@ -104,7 +114,8 @@ class LearningInterface:
 
     def _validate_state(self):
         defined_fields = set(self.defined_areas.keys())
-        if self.mandatory_fields.issubset(defined_fields):
+        # The new mandatory field is the anchor descriptor, not just the area
+        if self.mandatory_fields.issubset(defined_fields) and self.anchor_descriptors_b64:
             self.save_button.config(state=tk.NORMAL)
         else:
             self.save_button.config(state=tk.DISABLED)
@@ -136,16 +147,38 @@ class LearningInterface:
         w = int(abs(self.start_x - end_x) / self.zoom_level)
         h = int(abs(self.start_y - end_y) / self.zoom_level)
 
-        if w > 0 and h > 0:
+        if w > 5 and h > 5: # Enforce a minimum selection size
             final_coords = {"x": x, "y": y, "width": w, "height": h}
             
             if selected_field == "**VENDOR IDENTIFIER**":
+                # --- NEW: ORB FEATURE EXTRACTION LOGIC ---
                 box = (x, y, x + w, y + h)
                 identifier_image_crop = self.pil_image.crop(box)
-                self.identifier_hash = str(imagehash.phash(identifier_image_crop))
+                cv_crop = np.array(identifier_image_crop)
+                
+                orb = cv2.ORB_create(nfeatures=1000)
+                keypoints, descriptors = orb.detectAndCompute(cv_crop, None)
+                
+                # CRITICAL VALIDATION: Ensure the selected area is usable
+                if descriptors is None or len(descriptors) < 20:
+                    messagebox.showerror(
+                        "Anchor Too Weak",
+                        f"The selected area is not suitable for a vendor identifier. It produced only {len(descriptors) if descriptors is not None else 0} features. Please select a detailed, high-contrast logo or graphic.",
+                        parent=self.root
+                    )
+                    self.canvas.delete(self.selection_rect)
+                    self.start_x = None
+                    return
+                
+                # Serialize descriptors for JSON storage
+                self.anchor_descriptors_b64 = base64.b64encode(descriptors).decode('utf-8')
+                self.anchor_source_shape = {'width': w, 'height': h}
+                # --- END NEW LOGIC ---
+
                 self.defined_areas[selected_field] = final_coords
                 self.fields_listbox.itemconfig(selection_indices[0], {'fg': 'white', 'bg': 'dark green'})
-                logger.info(f"Captured '{selected_field}' with hash '{self.identifier_hash}' at {final_coords}")
+                logger.info(f"Captured '{selected_field}' with {len(descriptors)} ORB features at {final_coords}")
+                
                 new_name = simpledialog.askstring("Vendor Name", "Please enter a name for this vendor:", initialvalue=self.vendor_name, parent=self.root)
                 if new_name and new_name.strip():
                     self.vendor_name = new_name.strip()
@@ -167,14 +200,20 @@ class LearningInterface:
 
         logger.info("--- Test Phase Initiated ---")
         
-        # Build the proposed template in memory
+        # --- RE-ARCHITECTED TEMPLATE STRUCTURE ---
         identifier_coords = self.defined_areas["**VENDOR IDENTIFIER**"]
         proposed_template = {
             "vendor_name": self.vendor_name,
-            "identifier_area": identifier_coords,
-            "identifier_hash": self.identifier_hash,
+            "identifier_area": identifier_coords, # The origin of our new relative system
+            # "identifier_hash": self.identifier_hash, # DEPRECATED
+            "anchor_features": {
+                "descriptors_b64": self.anchor_descriptors_b64,
+                "source_shape": self.anchor_source_shape
+            },
             "fields": []
         }
+        # --- END RE-ARCHITECTURE ---
+
         data_fields = {k: v for k, v in self.defined_areas.items() if k != "**VENDOR IDENTIFIER**"}
         for name, coords in data_fields.items():
             proposed_template["fields"].append({"field_name": name, "coordinates": coords})

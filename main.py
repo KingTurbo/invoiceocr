@@ -10,15 +10,19 @@ import shutil
 import re
 import uuid
 from PIL import Image
+# Image.MAX_IMAGE_PIXELS = None
+
 import imagehash
-from pdf2image import convert_from_path # <-- CRITICAL IMPORT
+from pdf2image import convert_from_path
+
+import base64
+import numpy as np
 
 from src.core.logger_config import setup_logging
-# The import is now simplified, as split_multipage_pdf is gone.
 from src.core.document_processor import process_document
-# --- NEW ---
-# Import the non-negotiable skew correction module.
 from src.core.image_preprocessor import correct_skew
+# --- NEW: Import the new feature matching logic ---
+from src.core.feature_matcher import identify_vendor_via_features
 # --- END NEW ---
 from src.data import template_manager
 from src.ocr import engine
@@ -26,7 +30,7 @@ from src.gui.learning_interface import start_learning_gui
 from config.config import FIELDS_CONFIG, HASH_MATCH_THRESHOLD
 from src.output_handler import save_to_excel
 
-# All setup and configuration remains the same from previous steps...
+
 setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -37,13 +41,12 @@ ARCHIVE_DIR = BASE_DIR / "archive"
 TEMP_DIR = BASE_DIR / "temp_processed_images"
 EXCEL_OUTPUT_FILE = OUTPUT_DIR / "invoice_records.xlsx"
 
+
+
 TRIAGE_HASH_SIZE = 8
 TRIAGE_MATCH_THRESHOLD = 5
 TEMPLATE_CACHE = []
 
-# All functions from identify_vendor_via_hashing down to handle_production_path
-# remain UNCHANGED from the previous step (Strategy 2). For brevity, they
-# are included here without additional comments.
 
 def _generate_triage_hash(image_obj: Image.Image) -> imagehash.ImageHash:
     return imagehash.average_hash(image_obj, hash_size=TRIAGE_HASH_SIZE)
@@ -59,42 +62,69 @@ def load_and_cache_templates():
     loaded_count = 0
     for template_file in templates_dir.glob("*.json"):
         template = template_manager.load_template(template_file.stem)
-        if (template and "identifier_area" in template and "identifier_hash" in template and "vendor_name" in template):
+        
+        if (template and "anchor_features" in template and "vendor_name" in template):
+            try:
+                descriptors_b64 = template["anchor_features"]["descriptors_b64"]
+                des_bytes = base64.b64decode(descriptors_b64)
+                descriptors = np.frombuffer(des_bytes, dtype=np.uint8).reshape(-1, 32)
+
+                cached_item = {
+                    "vendor_name": template["vendor_name"],
+                    "template_type": "orb_features", 
+                    "anchor_descriptors": descriptors,
+                    "anchor_source_shape": template["anchor_features"]["source_shape"],
+                    "identifier_area": template["identifier_area"],
+                    "full_template_data": template,
+                }
+                TEMPLATE_CACHE.append(cached_item)
+                loaded_count += 1
+
+            except (ValueError, TypeError, KeyError) as e:
+                logger.error(f"Could not parse new ORB template '{template_file.name}'. Skipping. Error: {e}", exc_info=True)
+        
+        elif (template and "identifier_hash" in template and "vendor_name" in template):
             try:
                 precomputed_precise_hash = imagehash.hex_to_hash(template["identifier_hash"])
                 cached_item = {
-                    "vendor_name": template["vendor_name"], "identifier_area": template["identifier_area"],
-                    "precomputed_precise_hash": precomputed_precise_hash, "full_template_data": template,
+                    "vendor_name": template["vendor_name"],
+                    "template_type": "phash", 
+                    "identifier_area": template["identifier_area"],
+                    "precomputed_precise_hash": precomputed_precise_hash,
+                    "full_template_data": template,
                     "precomputed_triage_hash": None
                 }
                 if "triage_hash" in template and template["triage_hash"]:
                     cached_item["precomputed_triage_hash"] = imagehash.hex_to_hash(template["triage_hash"])
-                else:
-                    logger.warning(f"Template '{template['vendor_name']}' is missing a triage hash. It will be checked against every document.")
                 TEMPLATE_CACHE.append(cached_item)
                 loaded_count += 1
+
             except (ValueError, TypeError) as e:
-                logger.error(f"Could not parse hash for template '{template_file.name}'. Skipping. Error: {e}")
+                logger.error(f"Could not parse legacy hash for template '{template_file.name}'. Skipping. Error: {e}")
         else:
             logger.warning(f"Skipping invalid or incomplete template file: {template_file.name}")
+            
     logger.info(f"--- Template cache warmed. Loaded {loaded_count} templates. ---")
 
-def identify_vendor_via_hashing(processed_image_obj: Image.Image) -> tuple[str | None, dict | None]:
-    if not TEMPLATE_CACHE: return None, None
-    logger.debug("Starting Tier 1 (Triage) Filtering...")
+def identify_vendor_via_hashing(processed_image_obj: Image.Image, legacy_templates: list) -> tuple[str | None, dict | None]:
+    """ LEGACY IDENTIFICATION METHOD. This now only operates on templates of type 'phash'. """
+    if not legacy_templates:
+        return None, None
+
+    logger.debug("Starting Legacy Tier 1 (Triage Hashing)...")
     incoming_triage_hash = _generate_triage_hash(processed_image_obj)
     candidates = []
-    for cached_template in TEMPLATE_CACHE:
+    for cached_template in legacy_templates:
         if cached_template["precomputed_triage_hash"] is None:
             candidates.append(cached_template)
             continue
         triage_distance = incoming_triage_hash - cached_template["precomputed_triage_hash"]
         if triage_distance <= TRIAGE_MATCH_THRESHOLD:
-            logger.debug(f"Candidate found: '{cached_template['vendor_name']}' with triage distance {triage_distance}.")
             candidates.append(cached_template)
-    logger.info(f"Tier 1 complete. Found {len(candidates)} candidates out of {len(TEMPLATE_CACHE)} total templates.")
+    
     if not candidates: return None, None
-    logger.debug("Starting Tier 2 (Precise) Filtering on candidates...")
+    
+    logger.debug("Starting Legacy Tier 2 (Precise) Filtering on candidates...")
     for candidate_template in candidates:
         area = candidate_template["identifier_area"]
         box = (area['x'], area['y'], area['x'] + area['width'], area['y'] + area['height'])
@@ -102,16 +132,40 @@ def identify_vendor_via_hashing(processed_image_obj: Image.Image) -> tuple[str |
             new_invoice_crop = processed_image_obj.crop(box)
             new_precise_hash = imagehash.phash(new_invoice_crop)
         except IndexError:
-            logger.warning(f"Identifier area for '{candidate_template['vendor_name']}' is out of bounds. Skipping candidate.")
             continue
         precise_distance = new_precise_hash - candidate_template["precomputed_precise_hash"]
-        logger.debug(f"Tier 2 check for '{candidate_template['vendor_name']}': precise hash distance is {precise_distance}")
         if precise_distance <= HASH_MATCH_THRESHOLD:
             vendor_name = candidate_template["vendor_name"]
-            logger.info(f"MATCH CONFIRMED! Vendor identified as '{vendor_name}' with precise distance {precise_distance}.")
+            logger.info(f"LEGACY MATCH CONFIRMED! Vendor identified as '{vendor_name}'.")
             return vendor_name, candidate_template["full_template_data"]
-    logger.warning("Could not identify vendor. All candidates failed Tier 2 precise matching.")
+    
     return None, None
+
+# --- NEW: UNIFIED IDENTIFICATION ORCHESTRATOR ---
+def identify_vendor(processed_image_obj: Image.Image) -> tuple[str | None, dict | None]:
+    """
+    Orchestrates the vendor identification process, prioritizing the new robust
+    feature matching and falling back to legacy hashing for backward compatibility.
+    """
+    if not TEMPLATE_CACHE:
+        return None, None
+
+    # 1. Prioritize new ORB feature matching for maximum robustness.
+    orb_templates = [t for t in TEMPLATE_CACHE if t.get("template_type") == "orb_features"]
+    vendor_name, template_data = identify_vendor_via_features(processed_image_obj, orb_templates)
+    if vendor_name:
+        return vendor_name, template_data
+
+    # 2. Fallback to legacy hashing for older templates.
+    legacy_templates = [t for t in TEMPLATE_CACHE if t.get("template_type") == "phash"]
+    vendor_name, template_data = identify_vendor_via_hashing(processed_image_obj, legacy_templates)
+    if vendor_name:
+        return vendor_name, template_data
+
+    # 3. If no method succeeds, identification fails.
+    logger.warning("Could not identify vendor. All identification methods failed.")
+    return None, None
+# --- END NEW ---
 
 def setup_directories():
     INPUT_DIR.mkdir(exist_ok=True)
@@ -125,10 +179,6 @@ def _sanitize_filename(name: str) -> str:
 
 
 def handle_production_path(template, processed_image_obj: Image.Image, original_file_path):
-    """
-    Processes extracted data, saves to Excel, and RENAMES the already-archived
-    source file to its final, descriptive name.
-    """
     vendor_name = template["vendor_name"]
     logger.info(f"Production Path: Processing template for '{vendor_name}'.")
     extracted_data = {"vendor_name": vendor_name}
@@ -141,38 +191,25 @@ def handle_production_path(template, processed_image_obj: Image.Image, original_
     logger.info(f"Final extracted data for {original_file_path.name}: {extracted_data}")
     save_to_excel(extracted_data, EXCEL_OUTPUT_FILE)
     
-    # --- FIX FOR STRATEGY 3 WORKFLOW ---
-    # The original file was already moved to ARCHIVE_DIR during ingestion.
-    # Our job now is to RENAME it from its original name to the new, structured name.
-    
-    # 1. Calculate the final, desired filename.
     unique_id = str(uuid.uuid4()).split('-')[0]
     invoice_num = extracted_data.get("invoice_number", "UNKNOWN_INV")
     safe_vendor_name = _sanitize_filename(vendor_name)
     safe_invoice_num = _sanitize_filename(invoice_num)
     new_filename = f"{safe_vendor_name}_{safe_invoice_num}_{unique_id}{original_file_path.suffix}"
 
-    # 2. Define the source and destination paths WITHIN the archive directory.
     archived_original_path = ARCHIVE_DIR / original_file_path.name
     final_archive_path = ARCHIVE_DIR / new_filename
 
-    # 3. Perform a safe rename operation.
     try:
         if archived_original_path.exists():
             logger.info(f"Renaming archived file to '{new_filename}'")
             os.rename(archived_original_path, final_archive_path)
         else:
-            # This case handles multi-page PDFs where only the first page is identified.
-            # The original file might have a different name if it was part of a split.
-            # We log a warning but do not treat it as a critical error.
-            logger.warning(f"Could not find {archived_original_path} to rename. File might have already been renamed by another page's processing.")
+            logger.warning(f"Could not find {archived_original_path} to rename.")
 
     except OSError as e:
         logger.error(f"Failed to rename archived file {archived_original_path}. Error: {e}")
-    # --- END OF FIX ---
 
-
-# The start_interactive_session function also remains UNCHANGED.
 def start_interactive_session(unidentified_tasks: list):
     logger.info("--- Automated Processing Complete ---")
     if not unidentified_tasks:
@@ -187,60 +224,57 @@ def start_interactive_session(unidentified_tasks: list):
         seed_task['processed_image_obj'].save(temp_image_path)
         new_template = start_learning_gui(image_path=str(temp_image_path), suggested_vendor_name=suggested_name, fields_config=FIELDS_CONFIG, image_obj=seed_task['processed_image_obj'])
         os.remove(temp_image_path)
+        
         if new_template:
             final_vendor_name = new_template.get("vendor_name")
-            seed_image = seed_task['processed_image_obj']
-            triage_hash = _generate_triage_hash(seed_image)
-            new_template['triage_hash'] = str(triage_hash)
-            logger.info(f"Generated and added triage hash '{triage_hash}' to new template '{final_vendor_name}'.")
+            
+            # --- MODIFICATION: Remove legacy hash generation ---
+            # A triage hash is irrelevant for new ORB templates.
+            # new_template['triage_hash'] = str(_generate_triage_hash(seed_task['processed_image_obj']))
+            # logger.info(f"Generated and added triage hash to new template '{final_vendor_name}'.")
+            # --- END MODIFICATION ---
+
             template_manager.save_template(final_vendor_name, new_template)
-            logger.info(f"New template for '{final_vendor_name}' saved. Processing batch...")
-            try:
-                precomputed_precise_hash = imagehash.hex_to_hash(new_template["identifier_hash"])
-                precomputed_triage_hash = imagehash.hex_to_hash(new_template["triage_hash"])
-                cached_item = {
-                    "vendor_name": new_template["vendor_name"], "identifier_area": new_template["identifier_area"],
-                    "precomputed_precise_hash": precomputed_precise_hash, "precomputed_triage_hash": precomputed_triage_hash,
-                    "full_template_data": new_template
-                }
-                TEMPLATE_CACHE.append(cached_item)
-                logger.info(f"Live cache updated. Total templates: {len(TEMPLATE_CACHE)}")
-            except (ValueError, TypeError) as e:
-                logger.error(f"Could not add newly created template to cache. Error: {e}")
+            logger.info(f"New template for '{final_vendor_name}' saved. Reloading cache...")
+            load_and_cache_templates() # Reload to include the new template
+            
+            # Immediately process the seed task that was just used for learning
             handle_production_path(new_template, seed_task['processed_image_obj'], seed_task['original_path'])
-            unidentified_count = len(unidentified_tasks)
+            
+            # --- PROPAGATION LOGIC RESTORED ---
+            logger.info("--- Starting Propagation: Applying new template to remaining queue... ---")
             processed_count = 0
-            for i in range(unidentified_count - 1, -1, -1):
+            # Iterate backwards to safely remove items from the list
+            for i in range(len(unidentified_tasks) - 1, -1, -1):
                 task_to_check = unidentified_tasks[i]
-                vendor_name_propagated, template_data_propagated = identify_vendor_via_hashing(task_to_check['processed_image_obj'])
+                
+                # Use the new unified identification function
+                vendor_name_propagated, template_data_propagated = identify_vendor(task_to_check['processed_image_obj'])
+                
                 if template_data_propagated and template_data_propagated['vendor_name'] == final_vendor_name:
-                    logger.info(f"Propagated match found for: {task_to_check['original_path'].name}. Processing automatically.")
+                    logger.info(f"PROPAGATED MATCH FOUND for: {task_to_check['original_path'].name}. Processing automatically.")
                     handle_production_path(template_data_propagated, task_to_check['processed_image_obj'], task_to_check['original_path'])
-                    unidentified_tasks.pop(i)
+                    unidentified_tasks.pop(i) # Remove from queue
                     processed_count += 1
-            logger.info(f"Propagation complete: Processed {processed_count} additional documents automatically.")
+            logger.info(f"--- Propagation Complete: Processed {processed_count} additional documents automatically. ---")
+            # --- END PROPAGATION LOGIC ---
         else:
             logger.warning(f"GUI was cancelled for {suggested_name}. Skipping propagation.")
             unique_id = str(uuid.uuid4()).split('-')[0]
             new_filename = f"UNPROCESSED_{suggested_name}_{unique_id}{seed_task['original_path'].suffix}"
-            shutil.move(seed_task['original_path'], ARCHIVE_DIR / new_filename)
+            shutil.move(ARCHIVE_DIR / seed_task['original_path'].name, ARCHIVE_DIR / new_filename)
 
-# ==============================================================================
-# === STRATEGY 3 OPTIMIZATION: IN-MEMORY WORKFLOW ==============================
-# ==============================================================================
+
 def main():
     logger.info("--- Starting Document Processing Run ---")
     setup_directories()
     engine.initialize_reader()
+    
     load_and_cache_templates()
 
-    # --- STAGE 1: IN-MEMORY INGESTION ---
-    # Build a queue of in-memory image objects, completely avoiding intermediate files.
+
     logger.info("--- Stage 1: In-Memory Document Ingestion ---")
-    
-    # The processing_queue holds tuples of: (PIL.Image, original_Path_object, display_name)
     processing_queue = []
-    
     files_to_ingest = list(INPUT_DIR.glob('*'))
     if not files_to_ingest:
         logger.info("No files found in input directory to process.")
@@ -250,36 +284,23 @@ def main():
     for file_path in files_to_ingest:
         if not file_path.is_file():
             continue
-
         file_suffix = file_path.suffix.lower()
-        
         try:
             if file_suffix == '.pdf':
-                # Use pdf2image to directly convert all pages to in-memory, grayscale PIL objects.
-                # This is vastly more efficient than writing and re-reading temp files.
                 logger.info(f"Ingesting PDF: {file_path.name}")
-                images = convert_from_path(file_path, dpi=300, grayscale=True)
+                images = convert_from_path(file_path, dpi=200, grayscale=True)
                 for i, image_obj in enumerate(images):
-                    # --- MODIFICATION ---
-                    # Each page is passed through the skew correction module before queueing.
                     corrected_image = correct_skew(image_obj)
                     display_name = f"{file_path.stem}_page_{i+1}"
                     processing_queue.append((corrected_image, file_path, display_name))
-                    # --- END MODIFICATION ---
-                # Archive the original PDF immediately after successful conversion
-                # Note: For multi-page, all pages are handled before this move.
                 shutil.move(file_path, ARCHIVE_DIR / file_path.name)
 
             elif file_suffix in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
                 logger.info(f"Ingesting Image: {file_path.name}")
-                # Use the simplified process_document for image files
                 image_obj = process_document(file_path)
                 if image_obj:
-                    # --- MODIFICATION ---
-                    # The image is passed through the skew correction module before queueing.
                     corrected_image = correct_skew(image_obj)
                     processing_queue.append((corrected_image, file_path, file_path.name))
-                    # --- END MODIFICATION ---
                     shutil.move(file_path, ARCHIVE_DIR / file_path.name)
             else:
                 logger.warning(f"Unsupported file type '{file_suffix}'. Archiving as-is.")
@@ -287,32 +308,28 @@ def main():
         
         except Exception as e:
             logger.error(f"Failed to ingest file {file_path.name}. Archiving. Error: {e}")
-            # Ensure failed files are moved out of the input queue
             if file_path.exists():
                 shutil.move(file_path, ARCHIVE_DIR / f"FAILED_{file_path.name}")
 
-    # --- STAGE 2: PROCESS THE IN-MEMORY QUEUE ---
     logger.info(f"--- Stage 2: Processing {len(processing_queue)} pages from in-memory queue ---")
     unidentified_queue = []
 
     for processed_image_obj, original_path, display_name in processing_queue:
         logger.info(f"--- Processing item: {display_name} (from {original_path.name}) ---")
         
-        # The image is already processed and in memory, no need for process_document() call.
-        vendor_name, template_data = identify_vendor_via_hashing(processed_image_obj)
+        # --- MODIFICATION: Use the new unified identification function ---
+        vendor_name, template_data = identify_vendor(processed_image_obj)
+        # --- END MODIFICATION ---
 
         if vendor_name and template_data:
-            # We must handle archiving carefully. Since the original file is already
-            # moved, we just pass its original path for logging and file naming.
             handle_production_path(template_data, processed_image_obj, original_path)
         else:
             logger.info(f"Queueing '{display_name}' for interactive learning.")
             unidentified_queue.append({
-                "original_path": original_path, # Keep track of the source file
+                "original_path": original_path, 
                 "processed_image_obj": processed_image_obj
             })
     
-    # The interactive session now works on the unidentified items from memory.
     if unidentified_queue:
         start_interactive_session(unidentified_queue)
 
