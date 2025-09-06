@@ -16,6 +16,10 @@ from pdf2image import convert_from_path # <-- CRITICAL IMPORT
 from src.core.logger_config import setup_logging
 # The import is now simplified, as split_multipage_pdf is gone.
 from src.core.document_processor import process_document
+# --- NEW ---
+# Import the non-negotiable skew correction module.
+from src.core.image_preprocessor import correct_skew
+# --- END NEW ---
 from src.data import template_manager
 from src.ocr import engine
 from src.gui.learning_interface import start_learning_gui
@@ -256,8 +260,12 @@ def main():
                 logger.info(f"Ingesting PDF: {file_path.name}")
                 images = convert_from_path(file_path, dpi=300, grayscale=True)
                 for i, image_obj in enumerate(images):
+                    # --- MODIFICATION ---
+                    # Each page is passed through the skew correction module before queueing.
+                    corrected_image = correct_skew(image_obj)
                     display_name = f"{file_path.stem}_page_{i+1}"
-                    processing_queue.append((image_obj, file_path, display_name))
+                    processing_queue.append((corrected_image, file_path, display_name))
+                    # --- END MODIFICATION ---
                 # Archive the original PDF immediately after successful conversion
                 # Note: For multi-page, all pages are handled before this move.
                 shutil.move(file_path, ARCHIVE_DIR / file_path.name)
@@ -267,7 +275,11 @@ def main():
                 # Use the simplified process_document for image files
                 image_obj = process_document(file_path)
                 if image_obj:
-                    processing_queue.append((image_obj, file_path, file_path.name))
+                    # --- MODIFICATION ---
+                    # The image is passed through the skew correction module before queueing.
+                    corrected_image = correct_skew(image_obj)
+                    processing_queue.append((corrected_image, file_path, file_path.name))
+                    # --- END MODIFICATION ---
                     shutil.move(file_path, ARCHIVE_DIR / file_path.name)
             else:
                 logger.warning(f"Unsupported file type '{file_suffix}'. Archiving as-is.")
