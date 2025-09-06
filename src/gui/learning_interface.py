@@ -1,11 +1,7 @@
-
 import logging
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
 from PIL import Image, ImageTk
-# --- DEPRECATED ---
-# import imagehash
-# --- NEW IMPORTS ---
 import cv2
 import numpy as np
 import base64
@@ -18,17 +14,17 @@ class LearningInterface:
         self.image_path = image_path
         self.vendor_name = suggested_vendor_name
         self.fields_config = fields_config
-        self.pil_image = image_obj # Use the in-memory object
+        self.pil_image = image_obj
         
         self.defined_areas = {}
         self.mandatory_fields = {f['name'] for f in fields_config if f.get('mandatory') is True}
         self.all_fields = [f['name'] for f in fields_config]
 
-        # --- RE-ARCHITECTED ANCHOR DATA ---
-        # self.identifier_hash = None # This is now deprecated and removed.
+        # --- CORRECTED ANCHOR DATA STRUCTURE ---
         self.anchor_descriptors_b64 = None
+        self.anchor_keypoints_pts = None # NEW: To store (x,y) coordinates
         self.anchor_source_shape = None
-        # --- END RE-ARCHITECTURE ---
+        # --- END CORRECTION ---
         self.final_template = None
 
         self.start_x = None
@@ -114,7 +110,6 @@ class LearningInterface:
 
     def _validate_state(self):
         defined_fields = set(self.defined_areas.keys())
-        # The new mandatory field is the anchor descriptor, not just the area
         if self.mandatory_fields.issubset(defined_fields) and self.anchor_descriptors_b64:
             self.save_button.config(state=tk.NORMAL)
         else:
@@ -147,11 +142,10 @@ class LearningInterface:
         w = int(abs(self.start_x - end_x) / self.zoom_level)
         h = int(abs(self.start_y - end_y) / self.zoom_level)
 
-        if w > 5 and h > 5: # Enforce a minimum selection size
+        if w > 5 and h > 5:
             final_coords = {"x": x, "y": y, "width": w, "height": h}
             
             if selected_field == "**VENDOR IDENTIFIER**":
-                # --- NEW: ORB FEATURE EXTRACTION LOGIC ---
                 box = (x, y, x + w, y + h)
                 identifier_image_crop = self.pil_image.crop(box)
                 cv_crop = np.array(identifier_image_crop)
@@ -159,21 +153,17 @@ class LearningInterface:
                 orb = cv2.ORB_create(nfeatures=1000)
                 keypoints, descriptors = orb.detectAndCompute(cv_crop, None)
                 
-                # CRITICAL VALIDATION: Ensure the selected area is usable
                 if descriptors is None or len(descriptors) < 20:
-                    messagebox.showerror(
-                        "Anchor Too Weak",
-                        f"The selected area is not suitable for a vendor identifier. It produced only {len(descriptors) if descriptors is not None else 0} features. Please select a detailed, high-contrast logo or graphic.",
-                        parent=self.root
-                    )
+                    messagebox.showerror("Anchor Too Weak", f"The selected area is not suitable. It produced only {len(descriptors) if descriptors is not None else 0} features. Please select a detailed, high-contrast logo.", parent=self.root)
                     self.canvas.delete(self.selection_rect)
                     self.start_x = None
                     return
                 
-                # Serialize descriptors for JSON storage
+                # --- FIX: Serialize both descriptors AND keypoint coordinates ---
                 self.anchor_descriptors_b64 = base64.b64encode(descriptors).decode('utf-8')
+                self.anchor_keypoints_pts = [kp.pt for kp in keypoints] # Store as a list of (x,y) tuples
                 self.anchor_source_shape = {'width': w, 'height': h}
-                # --- END NEW LOGIC ---
+                # --- END FIX ---
 
                 self.defined_areas[selected_field] = final_coords
                 self.fields_listbox.itemconfig(selection_indices[0], {'fg': 'white', 'bg': 'dark green'})
@@ -183,13 +173,11 @@ class LearningInterface:
                 if new_name and new_name.strip():
                     self.vendor_name = new_name.strip()
                     self.root.title(f"Template Creation for: {self.vendor_name}")
-                    logger.info(f"Vendor name set to '{self.vendor_name}'.")
                 else:
                     logger.warning("User cancelled or entered an empty vendor name.")
             else:
                 self.defined_areas[selected_field] = final_coords
                 self.fields_listbox.itemconfig(selection_indices[0], {'fg': 'white', 'bg': 'green'})
-                logger.info(f"Captured '{selected_field}': {final_coords}")
             
             self._validate_state()
             
@@ -197,28 +185,25 @@ class LearningInterface:
 
     def _on_save_press(self):
         from src.ocr import engine
-
-        logger.info("--- Test Phase Initiated ---")
         
-        # --- RE-ARCHITECTED TEMPLATE STRUCTURE ---
+        # --- CORRECTED TEMPLATE STRUCTURE ---
         identifier_coords = self.defined_areas["**VENDOR IDENTIFIER**"]
         proposed_template = {
             "vendor_name": self.vendor_name,
-            "identifier_area": identifier_coords, # The origin of our new relative system
-            # "identifier_hash": self.identifier_hash, # DEPRECATED
+            "identifier_area": identifier_coords,
             "anchor_features": {
                 "descriptors_b64": self.anchor_descriptors_b64,
+                "keypoints_pts": self.anchor_keypoints_pts, # Add coordinates to template
                 "source_shape": self.anchor_source_shape
             },
             "fields": []
         }
-        # --- END RE-ARCHITECTURE ---
+        # --- END CORRECTION ---
 
         data_fields = {k: v for k, v in self.defined_areas.items() if k != "**VENDOR IDENTIFIER**"}
         for name, coords in data_fields.items():
             proposed_template["fields"].append({"field_name": name, "coordinates": coords})
 
-        # Perform targeted OCR to test the template
         extracted_results = {}
         for field in proposed_template["fields"]:
             field_name = field["field_name"]
@@ -226,29 +211,20 @@ class LearningInterface:
             extracted_text = engine.extract_text_from_area(self.pil_image, coords)
             extracted_results[field_name] = extracted_text.strip()
         
-        # Format the results for the confirmation dialog
         confirmation_message = "The system extracted the following data:\n\n"
         for name, text in extracted_results.items():
             confirmation_message += f"- {name}:  {text}\n"
         confirmation_message += "\nIs this data correct?"
 
-        # --- Confirm Phase ---
-        is_correct = messagebox.askyesno(
-            "Confirm Extracted Data",
-            confirmation_message,
-            parent=self.root
-        )
+        is_correct = messagebox.askyesno("Confirm Extracted Data", confirmation_message, parent=self.root)
 
         if is_correct:
-            logger.info("User confirmed extracted data is correct. Saving template.")
             self.final_template = proposed_template
             self.root.destroy()
         else:
             logger.warning("User rejected the extracted data. Returning to edit.")
-            self.instruction_label.config(text="Validation failed. Please correct your selections and try again.")
 
     def _on_cancel(self):
-        logger.warning("Template creation cancelled by user.")
         self.final_template = None
         self.root.destroy()
 
