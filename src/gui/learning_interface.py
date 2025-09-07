@@ -9,7 +9,6 @@ import base64
 
 logger = logging.getLogger(__name__)
 
-# --- NEW: Custom Dialog for Vendor Selection ---
 class VendorSelectionDialog(simpledialog.Dialog):
     def __init__(self, parent, title, existing_vendors, suggested_name):
         self.existing_vendors = existing_vendors
@@ -51,7 +50,7 @@ class LearningInterface:
         self.start_x = None
         self.start_y = None
         self.selection_rect = None
-        self.drawn_rects = [] # To keep track of drawn rectangles for the reset button
+        self.drawn_rects = []   
         self.zoom_level = 1.0
         self.tk_image = None
 
@@ -71,7 +70,6 @@ class LearningInterface:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # --- THIS IS THE FULL, CORRECT DEFINITION ---
         control_panel = ttk.Frame(main_frame, width=350)
         control_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         
@@ -113,7 +111,6 @@ class LearningInterface:
         h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._update_image_on_canvas()
-        # --- END OF FULL DEFINITION ---
 
     def _on_reset(self):
         logger.info("Resetting template creation.")
@@ -145,15 +142,11 @@ class LearningInterface:
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
         self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
-        # Redraw persistent rectangles after image update
         for rect_id in self.drawn_rects:
-            coords = self.canvas.coords(rect_id) # This won't work, we need to store original coords
-            # This part is complex, for now we will just re-add them
+            coords = self.canvas.coords(rect_id) 
         self._redraw_persistent_rects()
 
     def _redraw_persistent_rects(self):
-        # This is a simplified redraw, for a full implementation we'd need to store original coords
-        # and recalculate based on zoom. For now, we will re-add them which works for reset.
         pass
 
     def _on_zoom(self, event):
@@ -225,7 +218,6 @@ class LearningInterface:
             
         final_coords = {"x": x0, "y": y0, "width": w, "height": h}
         
-        # Draw the permanent rectangle and save its ID
         rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, end_x, end_y, outline='cyan', width=3)
         self.drawn_rects.append(rect_id)
 
@@ -251,7 +243,7 @@ class LearningInterface:
                         self.vendor_name = new_name
                         self.root.title(f"Template Creation for: {self.vendor_name}")
                         logger.info(f"Captured Primary Anchor with {len(descriptors)} features.")
-                    else: # User cancelled vendor selection
+                    else: 
                         self.primary_anchor = None
                         self.canvas.delete(self.drawn_rects.pop())
                 else:

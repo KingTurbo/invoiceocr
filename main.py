@@ -12,7 +12,7 @@ import uuid
 from PIL import Image
 import imagehash
 from pdf2image import convert_from_path
-import cv2 # <-- Import OpenCV
+import cv2
 
 
 from src.gui.learning_interface import start_learning_gui
