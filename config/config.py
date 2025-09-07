@@ -1,5 +1,6 @@
 FIELDS_CONFIG = [
-    {"name": "**VENDOR IDENTIFIER**", "mandatory": True},
+    {"name": "**PRIMARY ANCHOR**", "mandatory": True},
+    {"name": "**SECONDARY ANCHOR**", "mandatory": True},
     {"name": "invoice_number", "mandatory": True},
     {"name": "invoice_date", "mandatory": False},
     {"name": "total_amount", "mandatory": False}
@@ -10,8 +11,3 @@ HASH_MATCH_THRESHOLD = 2
 
 
 TRIAGE_AREA_RATIO = (0.0, 0.0, 1.0, 0.10) #top 10%
-
-
-
-
-
