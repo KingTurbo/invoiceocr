@@ -1,6 +1,2 @@
 .venv
-input
-output
-archive
-config/templates
 poppler-25.07.0
