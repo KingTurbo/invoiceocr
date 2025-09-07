@@ -1,4 +1,3 @@
-
 import sys
 from pathlib import Path
 project_root = Path(__file__).resolve().parent
@@ -14,6 +13,11 @@ from PIL import Image
 import imagehash
 from pdf2image import convert_from_path
 import cv2 # <-- Import OpenCV
+
+
+from src.gui.learning_interface import start_learning_gui
+from config.config import FIELDS_CONFIG, HASH_SIMILARITY_THRESHOLD 
+from src.output_handler import save_to_excel
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -52,6 +56,8 @@ def _decode_anchor(anchor_data: dict) -> dict:
     des_bytes = base64.b64decode(anchor_data["descriptors_b64"])
     descriptors = np.frombuffer(des_bytes, dtype=np.uint8).reshape(-1, 32)
     return {
+        # --- THIS IS THE CRITICAL FIX ---
+        "bounding_box": anchor_data["bounding_box"], # This line was missing
         "anchor_descriptors": descriptors,
         "anchor_keypoints_pts": anchor_data["keypoints_pts"],
     }
@@ -68,7 +74,6 @@ def load_and_cache_templates():
     for template_file in templates_dir.glob("*.json"):
         template = template_manager.load_template(template_file.stem)
         
-        # --- NEW: Load new 2-Anchor template structure ---
         if (template and "primary_anchor" in template and "secondary_anchor" in template):
             try:
                 cached_item = {
@@ -82,9 +87,7 @@ def load_and_cache_templates():
                 loaded_count += 1
             except (ValueError, TypeError, KeyError) as e:
                 logger.error(f"Could not parse new 2-Anchor template '{template_file.name}'. Skipping. Error: {e}", exc_info=True)
-        # --- LEGACY: Keep old hash-based loader for backward compatibility if needed ---
         elif (template and "identifier_hash" in template):
-            # This part can be removed if no legacy templates exist
             logger.warning(f"Loading legacy hash-based template: {template_file.name}")
             try:
                 precomputed_precise_hash = imagehash.hex_to_hash(template["identifier_hash"])
@@ -105,7 +108,6 @@ def load_and_cache_templates():
     logger.info(f"--- Template cache warmed. Loaded {loaded_count} templates. ---")
 
 def identify_vendor_via_hashing(processed_image_obj: Image.Image, legacy_templates: list) -> tuple[str | None, dict | None]:
-    # This function remains for legacy support but is no longer the primary method.
     if not legacy_templates: return None, None
     logger.debug("Attempting identification via legacy hashing...")
     for template in legacy_templates:
@@ -123,13 +125,11 @@ def identify_vendor_via_hashing(processed_image_obj: Image.Image, legacy_templat
 def identify_vendor(processed_image_obj: Image.Image) -> tuple[str | None, dict | None, tuple | None]:
     if not TEMPLATE_CACHE: return None, None, None
     
-    # Prioritize the new, robust method
     orb_templates = [t for t in TEMPLATE_CACHE if t.get("template_type") == "orb_features"]
     vendor_name, template_data, matched_points = identify_vendor_via_features(processed_image_obj, orb_templates)
     if vendor_name:
         return vendor_name, template_data, matched_points
 
-    # Fallback to legacy method
     legacy_templates = [t for t in TEMPLATE_CACHE if t.get("template_type") == "phash"]
     vendor_name, template_data = identify_vendor_via_hashing(processed_image_obj, legacy_templates)
     if vendor_name:
@@ -155,7 +155,6 @@ def handle_production_path(template: dict, processed_image_obj: Image.Image, ori
     if matched_points:
         logger.debug("Calculating Affine Transformation Matrix from matched anchor points.")
         src_pts, dst_pts = matched_points
-        # Use estimateAffinePartial2D for a robust transformation matrix
         transformation_matrix, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
         if transformation_matrix is None:
             logger.error(f"Failed to compute a valid transformation matrix for '{vendor_name}'. Aborting processing for this file.")
@@ -169,17 +168,12 @@ def handle_production_path(template: dict, processed_image_obj: Image.Image, ori
             continue
 
         if transformation_matrix is not None:
-            # Dynamically calculate the new field position
             x, y, w, h = coords['x'], coords['y'], coords['width'], coords['height']
-            # Define the corners of the source bounding box
             src_box = np.float32([[x, y], [x + w, y], [x, y + h], [x + w, y + h]]).reshape(-1, 1, 2)
-            # Apply the affine transform to find the new corners
             dst_box = cv2.transform(src_box, transformation_matrix)
-            # Get the axis-aligned bounding rectangle of the transformed quadrilateral
             x, y, w, h = cv2.boundingRect(dst_box)
             final_coords = (x, y, w, h)
         else:
-            # Fallback to static coordinates for legacy templates
             final_coords = tuple(coords.values())
             
         text = engine.extract_text_from_area(processed_image_obj, final_coords)
@@ -194,35 +188,51 @@ def handle_production_path(template: dict, processed_image_obj: Image.Image, ori
     safe_invoice_num = _sanitize_filename(invoice_num)
     new_filename = f"{safe_vendor_name}_{safe_invoice_num}_{unique_id}{original_file_path.suffix}"
     
-    # Move the original file from the input directory to its final archive destination
-    # This logic is simplified assuming the original file is still in ARCHIVE_DIR from the initial move.
     archived_original_path = ARCHIVE_DIR / original_file_path.name
     final_archive_path = ARCHIVE_DIR / new_filename
     try:
         if archived_original_path.exists():
             os.rename(archived_original_path, final_archive_path)
         else:
-            logger.warning(f"Could not find {archived_original_path} to rename. It might have been processed from a PDF.")
+            logger.warning(f"Could not find {archived_original_path} to rename.")
     except OSError as e:
         logger.error(f"Failed to rename archived file {archived_original_path}. Error: {e}")
 
+def _generate_lightweight_hash(image_obj: Image.Image) -> imagehash.ImageHash:
+    """Generates a fast and robust perceptual hash for similarity comparison."""
+    return imagehash.average_hash(image_obj, hash_size=16)
+
+
 def start_interactive_session(unidentified_tasks: list):
+    """
+    Manages the interactive GUI workflow for learning new templates.
+    Includes a vendor selection list and a lightweight similarity filter
+    to optimize the propagation process.
+    """
     if not unidentified_tasks:
         logger.info("No items require manual intervention.")
         return
+        
     logger.info(f"Starting interactive learning session for {len(unidentified_tasks)} documents.")
+
+    # Get a unique, sorted list of existing vendor names to pass to the GUI
+    existing_vendors = sorted(list(set(t['vendor_name'] for t in TEMPLATE_CACHE)))
+
     while unidentified_tasks:
         seed_task = unidentified_tasks.pop(0)
         suggested_name = seed_task['original_path'].stem
+        
         logger.info(f"\n--- Launching GUI for new vendor (Seed file: {suggested_name}) ---")
         temp_image_path = TEMP_DIR / f"{suggested_name}_learning.png"
         seed_task['processed_image_obj'].save(temp_image_path)
         
+        # Call the GUI, passing the list of existing vendors for the dropdown
         new_template = start_learning_gui(
             image_path=str(temp_image_path), 
             suggested_vendor_name=suggested_name, 
             fields_config=FIELDS_CONFIG, 
-            image_obj=seed_task['processed_image_obj']
+            image_obj=seed_task['processed_image_obj'],
+            existing_vendors=existing_vendors
         )
         os.remove(temp_image_path)
 
@@ -231,27 +241,62 @@ def start_interactive_session(unidentified_tasks: list):
             template_manager.save_template(final_vendor_name, new_template)
             logger.info(f"New template for '{final_vendor_name}' saved. Reloading cache...")
             load_and_cache_templates()
+            
+            # Update the vendor list for the next potential GUI session
+            if final_vendor_name not in existing_vendors:
+                existing_vendors.append(final_vendor_name)
+                existing_vendors.sort()
+
             # Process the seed document that was just used for learning
             handle_production_path(new_template, seed_task['processed_image_obj'], seed_task['original_path'])
             
+            # --- FEATURE: Lightweight Similarity Filter for Propagation ---
             logger.info("--- Starting Propagation: Applying new template to remaining queue... ---")
+            
+            # 1. Generate the hash of the document just trained
+            seed_hash = _generate_lightweight_hash(seed_task['processed_image_obj'])
+            
+            # 2. Pre-filter the queue to find only visually similar documents
+            candidate_tasks = []
+            other_tasks = []
+            logger.info(f"Pre-filtering {len(unidentified_tasks)} items for similarity...")
+            for task in unidentified_tasks:
+                task_hash = _generate_lightweight_hash(task['processed_image_obj'])
+                # Compare hashes using the configurable threshold
+                if (seed_hash - task_hash) <= HASH_SIMILARITY_THRESHOLD:
+                    candidate_tasks.append(task)
+                else:
+                    other_tasks.append(task)
+            
+            logger.info(f"Found {len(candidate_tasks)} visually similar candidates for propagation.")
+            
+            # 3. Run heavy feature matching ONLY on the small, pre-filtered candidate list
             processed_count = 0
-            remaining_tasks = []
-            for task_to_check in unidentified_tasks:
+            for task_to_check in candidate_tasks:
                 vendor_name_prop, template_data_prop, matched_points_prop = identify_vendor(task_to_check['processed_image_obj'])
+                
                 if template_data_prop and template_data_prop['vendor_name'] == final_vendor_name:
                     logger.info(f"PROPAGATED MATCH FOUND for: {task_to_check['original_path'].name}.")
                     handle_production_path(template_data_prop, task_to_check['processed_image_obj'], task_to_check['original_path'], matched_points_prop)
                     processed_count += 1
                 else:
-                    remaining_tasks.append(task_to_check)
-            unidentified_tasks = remaining_tasks
+                    # If it was a candidate but still failed the heavy check, it's not a match.
+                    # Add it back to the main queue for later processing.
+                    other_tasks.append(task_to_check)
+
+            # 4. The queue for the next iteration is now the remaining, non-similar items
+            unidentified_tasks = other_tasks
             logger.info(f"--- Propagation Complete: Processed {processed_count} additional documents automatically. ---")
+            # --- END of Propagation Logic ---
+            
         else:
             logger.warning(f"GUI was cancelled for {suggested_name}. Skipping propagation.")
             unique_id = str(uuid.uuid4()).split('-')[0]
             new_filename = f"UNPROCESSED_{suggested_name}_{unique_id}{seed_task['original_path'].suffix}"
             shutil.move(ARCHIVE_DIR / seed_task['original_path'].name, ARCHIVE_DIR / new_filename)
+
+            
+
 
 def main():
     logger.info("--- Starting Document Processing Run ---")
@@ -268,7 +313,6 @@ def main():
         
     for file_path in files_to_ingest:
         if not file_path.is_file(): continue
-        # Move file immediately to prevent reprocessing on failure
         shutil.move(file_path, ARCHIVE_DIR / file_path.name)
         archived_path = ARCHIVE_DIR / file_path.name
 
@@ -280,14 +324,14 @@ def main():
                     corrected_image = correct_skew(image_obj)
                     processing_queue.append((corrected_image, archived_path, f"{archived_path.stem}_page_{i+1}"))
             elif file_suffix in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
-                # process_document now expects a Path object
                 image_obj = process_document(archived_path)
                 if image_obj:
                     corrected_image = correct_skew(image_obj)
                     processing_queue.append((corrected_image, archived_path, archived_path.name))
         except Exception as e:
             logger.error(f"Failed to ingest file {file_path.name}. Archiving as FAILED. Error: {e}")
-            shutil.move(archived_path, ARCHIVE_DIR / f"FAILED_{archived_path.name}")
+            if archived_path.exists():
+                shutil.move(archived_path, ARCHIVE_DIR / f"FAILED_{archived_path.name}")
             
     logger.info(f"--- Stage 2: Processing {len(processing_queue)} pages from in-memory queue ---")
     unidentified_queue = []
