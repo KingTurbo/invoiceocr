@@ -1,3 +1,4 @@
+
 import logging
 import cv2
 import numpy as np
@@ -93,13 +94,22 @@ def correct_skew(image_obj: Image.Image) -> Image.Image:
         # Use the median angle for robust outlier rejection.
         median_angle = np.median(angles)
         
-        # --- NEW: Prevent over-correction of nearly straight images ---
+        # --- THIS IS THE DEFINITIVE FIX ---
+        # The previous threshold check `if abs(median_angle) < 0.05:` created
+        # a non-deterministic branch in the processing pipeline. Tiny, random
+        # variations in the calculated angle could cause one run to skip rotation
+        # and another to apply it, creating two different images from the same
+        # source and causing template matching to fail.
+        # By removing the threshold, we ensure that cv2.warpAffine is ALWAYS
+        # called. A rotation by a near-zero angle is effectively an identity
+        # transform, but it guarantees that every image passes through the
+        # exact same deterministic processing pipeline, producing a consistent
+        # pixel grid for reliable feature matching.
         if abs(median_angle) < 0.05:
-            logger.info("Image skew is negligible. No correction applied.")
-            return image_obj
-        # --- END NEW ---
-
-        logger.info(f"High-performance skew correction complete. Optimal angle determined: {median_angle:.2f} degrees.")
+             logger.info(f"Image skew is negligible ({median_angle:.4f} degrees), but applying transform to ensure deterministic output.")
+        else:
+            logger.info(f"High-performance skew correction complete. Optimal angle determined: {median_angle:.2f} degrees.")
+        # --- END OF FIX ---
         
         # --- PERFORMANCE OPTIMIZATION 2: Single, Accelerated Rotation ---
         # Apply the rotation to the ORIGINAL, full-resolution image.

@@ -1,3 +1,4 @@
+
 import sys
 from pathlib import Path
 project_root = Path(__file__).resolve().parent
@@ -52,14 +53,24 @@ def _generate_triage_hash(image_obj: Image.Image) -> imagehash.ImageHash:
     return imagehash.average_hash(image_obj, hash_size=TRIAGE_HASH_SIZE)
     
 def _decode_anchor(anchor_data: dict) -> dict:
-    """Helper to decode a single anchor from a template file."""
+    """
+    Helper to decode a single anchor from a template file, enforcing
+    strict NumPy data types for high-performance CV operations.
+    """
+    # Decode descriptors from base64 string to a uint8 NumPy array
     des_bytes = base64.b64decode(anchor_data["descriptors_b64"])
     descriptors = np.frombuffer(des_bytes, dtype=np.uint8).reshape(-1, 32)
+    
+    # --- THIS IS THE CRITICAL FIX ---
+    # Coerce the keypoint list-of-lists (from JSON) into a contiguous
+    # float32 NumPy array immediately upon loading. This prevents any
+    # data type ambiguity during the matching process.
+    keypoints_pts = np.float32(anchor_data["keypoints_pts"])
+    
     return {
-        # --- THIS IS THE CRITICAL FIX ---
-        "bounding_box": anchor_data["bounding_box"], # This line was missing
+        "bounding_box": anchor_data["bounding_box"],
         "anchor_descriptors": descriptors,
-        "anchor_keypoints_pts": anchor_data["keypoints_pts"],
+        "anchor_keypoints_pts": keypoints_pts,
     }
 
 def load_and_cache_templates():
@@ -215,7 +226,6 @@ def start_interactive_session(unidentified_tasks: list):
         
     logger.info(f"Starting interactive learning session for {len(unidentified_tasks)} documents.")
 
-    # Get a unique, sorted list of existing vendor names to pass to the GUI
     existing_vendors = sorted(list(set(t['vendor_name'] for t in TEMPLATE_CACHE)))
 
     while unidentified_tasks:
@@ -226,7 +236,6 @@ def start_interactive_session(unidentified_tasks: list):
         temp_image_path = TEMP_DIR / f"{suggested_name}_learning.png"
         seed_task['processed_image_obj'].save(temp_image_path)
         
-        # Call the GUI, passing the list of existing vendors for the dropdown
         new_template = start_learning_gui(
             image_path=str(temp_image_path), 
             suggested_vendor_name=suggested_name, 
@@ -242,37 +251,17 @@ def start_interactive_session(unidentified_tasks: list):
             logger.info(f"New template for '{final_vendor_name}' saved. Reloading cache...")
             load_and_cache_templates()
             
-            # Update the vendor list for the next potential GUI session
             if final_vendor_name not in existing_vendors:
                 existing_vendors.append(final_vendor_name)
                 existing_vendors.sort()
 
-            # Process the seed document that was just used for learning
             handle_production_path(new_template, seed_task['processed_image_obj'], seed_task['original_path'])
             
-            # --- FEATURE: Lightweight Similarity Filter for Propagation ---
             logger.info("--- Starting Propagation: Applying new template to remaining queue... ---")
             
-            # 1. Generate the hash of the document just trained
-            seed_hash = _generate_lightweight_hash(seed_task['processed_image_obj'])
-            
-            # 2. Pre-filter the queue to find only visually similar documents
-            candidate_tasks = []
-            other_tasks = []
-            logger.info(f"Pre-filtering {len(unidentified_tasks)} items for similarity...")
-            for task in unidentified_tasks:
-                task_hash = _generate_lightweight_hash(task['processed_image_obj'])
-                # Compare hashes using the configurable threshold
-                if (seed_hash - task_hash) <= HASH_SIMILARITY_THRESHOLD:
-                    candidate_tasks.append(task)
-                else:
-                    other_tasks.append(task)
-            
-            logger.info(f"Found {len(candidate_tasks)} visually similar candidates for propagation.")
-            
-            # 3. Run heavy feature matching ONLY on the small, pre-filtered candidate list
+            remaining_tasks = []
             processed_count = 0
-            for task_to_check in candidate_tasks:
+            for task_to_check in unidentified_tasks:
                 vendor_name_prop, template_data_prop, matched_points_prop = identify_vendor(task_to_check['processed_image_obj'])
                 
                 if template_data_prop and template_data_prop['vendor_name'] == final_vendor_name:
@@ -280,14 +269,10 @@ def start_interactive_session(unidentified_tasks: list):
                     handle_production_path(template_data_prop, task_to_check['processed_image_obj'], task_to_check['original_path'], matched_points_prop)
                     processed_count += 1
                 else:
-                    # If it was a candidate but still failed the heavy check, it's not a match.
-                    # Add it back to the main queue for later processing.
-                    other_tasks.append(task_to_check)
+                    remaining_tasks.append(task_to_check)
 
-            # 4. The queue for the next iteration is now the remaining, non-similar items
-            unidentified_tasks = other_tasks
+            unidentified_tasks = remaining_tasks
             logger.info(f"--- Propagation Complete: Processed {processed_count} additional documents automatically. ---")
-            # --- END of Propagation Logic ---
             
         else:
             logger.warning(f"GUI was cancelled for {suggested_name}. Skipping propagation.")

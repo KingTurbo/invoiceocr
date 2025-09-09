@@ -1,3 +1,4 @@
+
 import logging
 import cv2
 import numpy as np
@@ -5,155 +6,121 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-MIN_INLIER_COUNT = 12
+# Constants for the new robust matching logic
 LOWE_RATIO = 0.75
-PRIMARY_ANCHOR_SEARCH_REGION = (0.0, 0.0, 1.0, 0.35) 
-
-def _find_anchor_in_large_region(
-    incoming_cv_image: np.ndarray,
-    template_anchor_data: dict
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    h, w = incoming_cv_image.shape[:2]
-    x_start, y_start, x_end_rel, y_end_rel = PRIMARY_ANCHOR_SEARCH_REGION
-    
-    search_area_y_end = int(h * y_end_rel)
-    search_area_x_end = int(w * x_end_rel)
-    search_region_cv = incoming_cv_image[0:search_area_y_end, 0:search_area_x_end]
-
-    orb = cv2.ORB_create(nfeatures=4000)
-    kp_incoming, des_incoming = orb.detectAndCompute(search_region_cv, None)
-
-    if des_incoming is None:
-        return None, None
-        
-    des_template = template_anchor_data["anchor_descriptors"]
-    kp_template_pts = template_anchor_data["anchor_keypoints_pts"]
-    
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    matches = bf.knnMatch(des_template, des_incoming, k=2)
-
-    # --- THIS IS THE CORRECTED LOGIC ---
-    good_matches = []
-    for match_pair in matches:
-        # Check if knnMatch returned a pair of matches
-        if len(match_pair) == 2:
-            m, n = match_pair
-            if m.distance < LOWE_RATIO * n.distance:
-                good_matches.append(m)
-    # --- END CORRECTION ---
-
-    if len(good_matches) >= MIN_INLIER_COUNT:
-        src_pts_all = np.float32([kp_template_pts[m.queryIdx] for m in good_matches])
-        dst_pts_all = np.float32([kp_incoming[m.trainIdx].pt for m in good_matches])
-
-        M, mask = cv2.findHomography(src_pts_all, dst_pts_all, cv2.RANSAC, 5.0)
-        
-        if M is not None and np.sum(mask) >= MIN_INLIER_COUNT:
-            src_pts_inliers = src_pts_all[mask.ravel() == 1]
-            dst_pts_inliers = dst_pts_all[mask.ravel() == 1]
-            return src_pts_inliers, dst_pts_inliers
-            
-    return None, None
-
-def _find_anchor_in_guided_roi(
-    incoming_cv_image: np.ndarray,
-    template_anchor_data: dict,
-    predicted_center: tuple[int, int]
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    roi_size = 200
-    px, py = int(predicted_center[0]), int(predicted_center[1])
-
-    y_start = max(0, py - roi_size // 2)
-    y_end = py + roi_size // 2
-    x_start = max(0, px - roi_size // 2)
-    x_end = px + roi_size // 2
-    
-    roi_crop_cv = incoming_cv_image[y_start:y_end, x_start:x_end]
-    
-    if roi_crop_cv.size == 0: return None, None
-
-    orb = cv2.ORB_create(nfeatures=1500)
-    kp_incoming_roi, des_incoming_roi = orb.detectAndCompute(roi_crop_cv, None)
-
-    if des_incoming_roi is None: return None, None
-        
-    des_template = template_anchor_data["anchor_descriptors"]
-    kp_template_pts = template_anchor_data["anchor_keypoints_pts"]
-    
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    matches = bf.knnMatch(des_template, des_incoming_roi, k=2)
-
-    # --- THIS IS THE SAME CORRECTION, APPLIED HERE AS WELL ---
-    good_matches = []
-    for match_pair in matches:
-        # Check if knnMatch returned a pair of matches
-        if len(match_pair) == 2:
-            m, n = match_pair
-            if m.distance < LOWE_RATIO * n.distance:
-                good_matches.append(m)
-    # --- END CORRECTION ---
-
-    if len(good_matches) >= MIN_INLIER_COUNT:
-        src_pts_all = np.float32([kp_template_pts[m.queryIdx] for m in good_matches])
-        dst_pts_all = np.float32([(kp.pt[0] + x_start, kp.pt[1] + y_start) for kp in [kp_incoming_roi[m.trainIdx] for m in good_matches]])
-
-        M, mask = cv2.findHomography(src_pts_all, dst_pts_all, cv2.RANSAC, 5.0)
-        
-        if M is not None and np.sum(mask) >= MIN_INLIER_COUNT:
-            src_pts_inliers = src_pts_all[mask.ravel() == 1]
-            dst_pts_inliers = dst_pts_all[mask.ravel() == 1]
-            return src_pts_inliers, dst_pts_inliers
-            
-    return None, None
+MIN_PRIMARY_INLIERS = 12
+MIN_SECONDARY_INLIERS_CONSISTENT = 10 # Min number of secondary points that must agree with the primary transform
+SECONDARY_VERIFICATION_THRESHOLD_PX = 7.5 # Max distance (in pixels) for a secondary point to be considered consistent
 
 def identify_vendor_via_features(
     processed_image_obj: Image.Image, 
     orb_templates: list
 ) -> tuple[str | None, dict | None, tuple[np.ndarray, np.ndarray] | None]:
+    """
+    Identifies a vendor using a context-invariant feature matching strategy.
+    
+    This definitive algorithm works by:
+    1.  Generating a single, global set of keypoints and descriptors from the new document.
+    2.  For each template, it first finds and validates the primary anchor against this global set.
+    3.  If the primary anchor is found, it uses the resulting geometric transformation to verify
+        that the secondary anchor's features also exist and are in the correct relative positions.
+    This two-factor geometric lock prevents context-switching errors and provides maximum stability.
+    """
     if not orb_templates: return None, None, None
 
-    logger.debug(f"Starting Hybrid Regional Search against {len(orb_templates)} templates.")
+    logger.debug("Starting context-invariant feature matching.")
     incoming_cv_image = np.array(processed_image_obj)
+
+    # Step 1: Create a single, authoritative context for the incoming document.
+    orb = cv2.ORB_create(nfeatures=5000)
+    kp_incoming, des_incoming = orb.detectAndCompute(incoming_cv_image, None)
+    
+    if des_incoming is None:
+        logger.warning("Could not find any features in the incoming document.")
+        return None, None, None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
     for template in orb_templates:
         vendor_name = template["vendor_name"]
         
-        primary_src_pts, primary_dst_pts = _find_anchor_in_large_region(
-            incoming_cv_image, template["primary_anchor"]
-        )
-        if primary_src_pts is None:
-            continue
+        # --- Stage 1: Find and Validate the Primary Anchor ---
+        primary_des_template = template["primary_anchor"]["anchor_descriptors"]
+        primary_kp_template = template["primary_anchor"]["anchor_keypoints_pts"]
         
-        logger.info(f"Primary anchor candidate found for '{vendor_name}'. Calculating relative secondary position...")
-
-        p_box = template["primary_anchor"]["bounding_box"]
-        s_box = template["secondary_anchor"]["bounding_box"]
-        p_center_template = (p_box['x'] + p_box['width']/2, p_box['y'] + p_box['height']/2)
-        s_center_template = (s_box['x'] + s_box['width']/2, s_box['y'] + s_box['height']/2)
-        vector = (s_center_template[0] - p_center_template[0], s_center_template[1] - p_center_template[1])
-
-        p_center_found = np.mean(primary_dst_pts, axis=0)
+        # Match primary anchor against the global descriptor set
+        matches_primary = bf.knnMatch(primary_des_template, des_incoming, k=2)
         
-        predicted_s_center = (p_center_found[0] + vector[0], p_center_found[1] + vector[1])
+        good_matches_primary = []
+        for match_pair in matches_primary:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < LOWE_RATIO * n.distance:
+                    good_matches_primary.append(m)
 
-        secondary_src_pts, secondary_dst_pts = _find_anchor_in_guided_roi(
-            incoming_cv_image, template["secondary_anchor"], predicted_s_center
-        )
+        if len(good_matches_primary) < MIN_PRIMARY_INLIERS:
+            continue # Not enough initial matches, try next template
 
-        if secondary_src_pts is None:
-            continue
-
-        logger.info(f"Secondary anchor CONFIRMED for '{vendor_name}'.")
-        logger.info(f"GEOMETRIC LOCK CONFIRMED! Best match is '{vendor_name}'.")
-
-        all_src_pts = np.vstack((primary_src_pts, secondary_src_pts))
-        all_dst_pts = np.vstack((primary_dst_pts, secondary_dst_pts))
-
-        return (
-            vendor_name, 
-            template["full_template_data"], 
-            (all_src_pts, all_dst_pts)
-        )
+        # Get the coordinates for all good matches
+        src_pts_primary = primary_kp_template[[m.queryIdx for m in good_matches_primary]]
+        dst_pts_primary = np.float32([kp_incoming[m.trainIdx].pt for m in good_matches_primary])
         
+        # Validate the primary match with a robust affine model
+        affine_matrix, inlier_mask_primary = cv2.estimateAffinePartial2D(src_pts_primary, dst_pts_primary, method=cv2.RANSAC)
+        
+        if affine_matrix is None or np.sum(inlier_mask_primary) < MIN_PRIMARY_INLIERS:
+            continue # Geometric validation failed for primary anchor
+
+        logger.info(f"Primary anchor candidate CONFIRMED for '{vendor_name}'. Verifying secondary anchor...")
+        
+        # --- Stage 2: Verify the Secondary Anchor Using the Primary Transform ---
+        secondary_des_template = template["secondary_anchor"]["anchor_descriptors"]
+        secondary_kp_template = template["secondary_anchor"]["anchor_keypoints_pts"]
+        
+        # Match secondary anchor against the SAME global descriptor set
+        matches_secondary = bf.knnMatch(secondary_des_template, des_incoming, k=2)
+        
+        good_matches_secondary = []
+        for match_pair in matches_secondary:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < LOWE_RATIO * n.distance:
+                    good_matches_secondary.append(m)
+
+        if len(good_matches_secondary) < MIN_SECONDARY_INLIERS_CONSISTENT:
+            continue # Not enough secondary matches to even attempt verification
+            
+        # Get coordinates for secondary matches
+        src_pts_secondary = secondary_kp_template[[m.queryIdx for m in good_matches_secondary]]
+        dst_pts_secondary_actual = np.float32([kp_incoming[m.trainIdx].pt for m in good_matches_secondary])
+
+        # Use the transform from the primary anchor to predict where the secondary points should be
+        # Note: cv2.transform needs shape (N, 1, 2)
+        src_pts_secondary_reshaped = src_pts_secondary.reshape(-1, 1, 2)
+        dst_pts_secondary_predicted = cv2.transform(src_pts_secondary_reshaped, affine_matrix)
+        
+        # Calculate the distance between actual and predicted points
+        distances = np.linalg.norm(dst_pts_secondary_actual.reshape(-1, 1, 2) - dst_pts_secondary_predicted, axis=2)
+        
+        # Check how many points are consistent with the primary transformation
+        consistent_point_count = np.sum(distances < SECONDARY_VERIFICATION_THRESHOLD_PX)
+        
+        if consistent_point_count >= MIN_SECONDARY_INLIERS_CONSISTENT:
+            logger.info(f"Secondary anchor CONFIRMED for '{vendor_name}'.")
+            logger.info(f"GEOMETRIC LOCK CONFIRMED! Best match is '{vendor_name}'.")
+
+            # Success! Combine the inliers from the primary match for the final transformation
+            primary_src_inliers = src_pts_primary[inlier_mask_primary.ravel() == 1]
+            primary_dst_inliers = dst_pts_primary[inlier_mask_primary.ravel() == 1]
+            
+            # For simplicity in this fix, we will use only the primary inliers for transformation.
+            # A more advanced system could combine both, but this is robust.
+            
+            return (
+                vendor_name, 
+                template["full_template_data"], 
+                (primary_src_inliers, primary_dst_inliers)
+            )
+            
     logger.info("Could not identify vendor via Hybrid Regional Search.")
     return None, None, None

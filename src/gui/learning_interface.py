@@ -1,4 +1,3 @@
-
 import logging
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
@@ -6,6 +5,7 @@ from PIL import Image, ImageTk
 import cv2
 import numpy as np
 import base64
+from config.config import MIN_FEATURES_FOR_VALID_ANCHOR
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,16 @@ class LearningInterface:
         self.drawn_rects = []   
         self.zoom_level = 1.0
         self.tk_image = None
+
+        # --- DEFINITIVE FIX: CONTEXT-AWARE FEATURE GENERATION ---
+        # Generate all features from the full image ONCE at the beginning.
+        # This ensures descriptors have the correct "full image" context.
+        logger.info("Pre-computing all features for the document to ensure contextual consistency...")
+        self.full_image_cv = np.array(self.pil_image)
+        self.orb_detector = cv2.ORB_create(nfeatures=5000) # Increased features for better coverage
+        self.global_keypoints, self.global_descriptors = self.orb_detector.detectAndCompute(self.full_image_cv, None)
+        logger.info(f"Found {len(self.global_keypoints)} total features in the document.")
+        # --- END OF FIX ---
 
         self.setup_ui()
         self._update_workflow_state()
@@ -208,8 +218,9 @@ class LearningInterface:
         end_x, end_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         x0 = int(min(self.start_x, end_x) / self.zoom_level)
         y0 = int(min(self.start_y, end_y) / self.zoom_level)
-        w = int(abs(self.start_x - end_x) / self.zoom_level)
-        h = int(abs(self.start_y - end_y) / self.zoom_level)
+        x1 = int(max(self.start_x, end_x) / self.zoom_level)
+        y1 = int(max(self.start_y, end_y) / self.zoom_level)
+        w, h = x1 - x0, y1 - y0
 
         if w < 10 or h < 10:
             self.canvas.delete(self.selection_rect)
@@ -222,19 +233,33 @@ class LearningInterface:
         self.drawn_rects.append(rect_id)
 
         if self.current_step in ["**PRIMARY ANCHOR**", "**SECONDARY ANCHOR**"]:
-            box = (x0, y0, x0 + w, y0 + h)
-            anchor_image_crop = self.pil_image.crop(box)
-            cv_crop = np.array(anchor_image_crop)
+            # --- DEFINITIVE FIX: Filter pre-computed global features ---
+            # Instead of running ORB on a crop, filter the global features
+            # that were computed with full-image context.
             
-            orb = cv2.ORB_create(nfeatures=1000)
-            keypoints, descriptors = orb.detectAndCompute(cv_crop, None)
+            # 1. Find the indices of keypoints that lie within the user's box
+            anchor_kp_indices = []
+            for i, kp in enumerate(self.global_keypoints):
+                if x0 <= kp.pt[0] <= x1 and y0 <= kp.pt[1] <= y1:
+                    anchor_kp_indices.append(i)
             
-            if descriptors is None or len(descriptors) < 20:
-                messagebox.showerror("Anchor Too Weak", f"The selected area is not suitable. It produced only {len(descriptors) if descriptors is not None else 0} features.", parent=self.root)
-                self.canvas.delete(self.drawn_rects.pop()) # Remove the failed rect
+            if self.global_descriptors is None or len(anchor_kp_indices) < MIN_FEATURES_FOR_VALID_ANCHOR:
+                messagebox.showerror("Anchor Too Weak", f"The selected area is not suitable. It contained only {len(anchor_kp_indices)} features, but the minimum required is {MIN_FEATURES_FOR_VALID_ANCHOR}.", parent=self.root)
+                self.canvas.delete(self.drawn_rects.pop())
             else:
-                global_keypoints_pts = [(kp.pt[0] + x0, kp.pt[1] + y0) for kp in keypoints]
-                anchor_data = { "bounding_box": final_coords, "descriptors_b64": base64.b64encode(descriptors).decode('utf-8'), "keypoints_pts": global_keypoints_pts, "source_shape": {'width': w, 'height': h} }
+                # 2. Use the indices to select the corresponding keypoints and descriptors
+                selected_kps = [self.global_keypoints[i] for i in anchor_kp_indices]
+                selected_descriptors = self.global_descriptors[anchor_kp_indices]
+                
+                # 3. Get the global coordinates directly from the selected keypoints
+                keypoints_pts_to_save = [kp.pt for kp in selected_kps]
+                
+                anchor_data = {
+                    "bounding_box": final_coords,
+                    "descriptors_b64": base64.b64encode(selected_descriptors).decode('utf-8'),
+                    "keypoints_pts": keypoints_pts_to_save,
+                }
+                # --- END OF FIX ---
                 
                 if self.current_step == "**PRIMARY ANCHOR**":
                     self.primary_anchor = anchor_data
@@ -242,13 +267,13 @@ class LearningInterface:
                     if new_name:
                         self.vendor_name = new_name
                         self.root.title(f"Template Creation for: {self.vendor_name}")
-                        logger.info(f"Captured Primary Anchor with {len(descriptors)} features.")
+                        logger.info(f"Captured Primary Anchor with {len(selected_descriptors)} context-aware features.")
                     else: 
                         self.primary_anchor = None
                         self.canvas.delete(self.drawn_rects.pop())
                 else:
                     self.secondary_anchor = anchor_data
-                    logger.info(f"Captured Secondary Anchor with {len(descriptors)} features.")
+                    logger.info(f"Captured Secondary Anchor with {len(selected_descriptors)} context-aware features.")
         else:
             selection_indices = self.fields_listbox.curselection()
             if not selection_indices:
